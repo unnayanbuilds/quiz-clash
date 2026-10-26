@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: quiz-clash-server
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: CLIENT_ORIGIN
+        value: https://quiz-clash-mvp.vercel.app
