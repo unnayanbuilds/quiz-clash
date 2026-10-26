@@ -1,23 +1,20 @@
 import express from "express";
-import http from "http";
+import http from "node:http";
 import cors from "cors";
 import { Server } from "socket.io";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 
 const PORT = process.env.PORT || 3001;
-const allowedOrigins = (process.env.CLIENT_ORIGIN || "*").split(",").map(s => s.trim());
+const origins = (process.env.CLIENT_ORIGIN || "*").split(",").map(x => x.trim()).filter(Boolean);
+const origin = origins.includes("*") ? true : origins;
 const app = express();
-app.use(cors({ origin: allowedOrigins.includes("*") ? true : allowedOrigins }));
+app.use(cors({ origin }));
 app.get("/", (_req, res) => res.json({ name: "Quiz Clash API", status: "ok" }));
 app.get("/health", (_req, res) => res.json({ status: "ok", rooms: rooms.size }));
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: allowedOrigins.includes("*") ? true : allowedOrigins, methods: ["GET", "POST"] },
-  pingInterval: 25000,
-  pingTimeout: 20000
-});
+const httpServer = http.createServer(app);
+const io = new Server(httpServer, { cors: { origin, methods: ["GET", "POST"] }, pingInterval: 25000, pingTimeout: 20000 });
 
-const QUESTION_BANK = [
+const RAW = [
 ["Which planet is known as the Red Planet?","Venus","Mars","Jupiter","Mercury",1,"Science"],
 ["What is the chemical symbol for gold?","Ag","Gd","Au","Go",2,"Science"],
 ["Which gas do plants absorb?","Oxygen","Nitrogen","Carbon dioxide","Hydrogen",2,"Science"],
@@ -38,196 +35,145 @@ const QUESTION_BANK = [
 ["What is 1 byte equal to?","4 bits","8 bits","16 bits","32 bits",1,"Computers"],
 ["Which SQL command reads rows?","PUSH","SELECT","FETCHALL","OPEN",1,"Computers"],
 ["Which one is an operating system?","React","Node.js","Linux","PostgreSQL",2,"Computers"],
-["What does RAM provide?","Long-term archive","Temporary working memory","Internet access","Power regulation",1,"Computers"],
-["Which company created the Java language originally?","Sun Microsystems","Apple","IBM","Nokia",0,"Computers"],
-["In programming, what does JSON stand for?","Java Source Object Notation","JavaScript Object Notation","Joined System Output Network","Java Syntax Order Number",1,"Computers"],
-["Which symbol commonly starts a comment in JavaScript?","<!--","//","##","**",1,"Computers"],
-["What is the result of 7 × 8?","54","56","64","58",1,"Reasoning"],
+["What is 7 × 8?","54","56","64","58",1,"Reasoning"],
 ["What comes next: 2, 4, 8, 16, __?","18","24","30","32",3,"Reasoning"],
-["If all Bloops are Razzies and all Razzies are Lazzies, are all Bloops Lazzies?","Yes","No","Cannot say","Only sometimes",0,"Reasoning"],
 ["How many sides does a hexagon have?","5","6","7","8",1,"Reasoning"],
 ["What is 15% of 200?","15","20","30","35",2,"Reasoning"],
 ["Which number is prime?","21","27","29","33",2,"Reasoning"],
 ["A dozen equals how many?","10","12","14","20",1,"Reasoning"],
-["If today is Monday, what day is it in 10 days?","Wednesday","Thursday","Friday","Saturday",1,"Reasoning"],
 ["What is the square root of 144?","10","11","12","14",2,"Reasoning"],
-["Which is the odd one out?","Triangle","Square","Circle","Cube",3,"Reasoning"],
 ["What is the capital of Japan?","Seoul","Beijing","Tokyo","Bangkok",2,"General Knowledge"],
-["How many continents are commonly taught?","5","6","7","8",2,"General Knowledge"],
 ["Which ocean is the largest?","Atlantic","Indian","Arctic","Pacific",3,"General Knowledge"],
 ["Which country is famous for the pyramids of Giza?","Mexico","Egypt","Greece","Peru",1,"General Knowledge"],
 ["What is the currency of the United Kingdom?","Euro","Dollar","Pound sterling","Yen",2,"General Knowledge"],
 ["Which is the largest mammal?","African elephant","Blue whale","Giraffe","Orca",1,"General Knowledge"],
-["How many rings are on the Olympic flag?","4","5","6","7",1,"Sports"],
-["In football (soccer), how many players per team start on the field?","9","10","11","12",2,"Sports"],
+["In football, how many players per team start on the field?","9","10","11","12",2,"Sports"],
 ["Which sport uses a shuttlecock?","Squash","Badminton","Tennis","Table tennis",1,"Sports"],
-["How long is a standard marathon, approximately?","21.1 km","30 km","42.195 km","50 km",2,"Sports"],
-["Which country hosted the 2016 Summer Olympics?","China","Brazil","Japan","UK",1,"Sports"],
+["How long is a standard marathon?","21.1 km","30 km","42.195 km","50 km",2,"Sports"],
 ["In chess, which piece moves in an L shape?","Bishop","Rook","Knight","Queen",2,"Sports"],
 ["What is the term for zero in tennis?","Nil","Love","Blank","Duck",1,"Sports"],
 ["Which Indian city is known as India's Silicon Valley?","Mumbai","Hyderabad","Bengaluru","Pune",2,"General Knowledge"],
 ["What is the national animal of India?","Lion","Bengal tiger","Elephant","Leopard",1,"General Knowledge"],
 ["Which festival is known as the festival of lights?","Holi","Eid","Diwali","Pongal",2,"General Knowledge"]
-].map((q, i) => ({ id: i + 1, text: q[0], options: q.slice(1,5), correctIndex: q[5], category: q[6] }));
+];
+const QUESTIONS = RAW.map((q, i) => ({ id: i + 1, text: q[0], options: q.slice(1, 5), correctIndex: q[5], category: q[6] }));
+const rooms = new Map(), socketRoom = new Map(), sessions = new Map();
+const QUESTION_MS = 12000, MATCH_QUESTIONS = 10, MAX_PLAYERS = 8, GRACE_MS = 60000;
 
-const rooms = new Map();
-const playerRoom = new Map();
-const QUESTION_MS = 12000;
-const MATCH_QUESTIONS = 10;
-const MAX_PLAYERS = 8;
-
-function code() {
-  let c;
-  do { c = randomBytes(3).toString("hex").slice(0, 6).toUpperCase(); } while (rooms.has(c));
-  return c;
-}
-function safePlayer(p, viewerId) {
-  return { id: p.id, label: p.id === viewerId ? p.nickname : p.label, isHost: p.isHost, connected: p.connected };
-}
-function roomPayload(room, viewerId) {
-  return {
-    code: room.code, hostId: room.hostId, status: room.status,
-    players: [...room.players.values()].map(p => safePlayer(p, viewerId)),
-    questionIndex: room.questionIndex,
-    questionCount: room.questions.length,
-    question: room.status === "playing" ? publicQuestion(room.questions[room.questionIndex]) : null,
-    deadline: room.deadline,
-    scores: [...room.players.values()].map(p => ({ id: p.id, label: p.id === viewerId ? p.nickname : p.label, score: p.score })),
-    results: room.status === "finished" ? [...room.players.values()].map(p => ({ id: p.id, label: p.id === viewerId ? p.nickname : p.label, score: p.score })).sort((a,b) => b.score-a.score) : null
-  };
-}
-function publicQuestion(q) {
-  if (!q) return null;
-  return { id: q.id, text: q.text, options: q.options, category: q.category };
-}
+function roomCode() { let c; do { c = randomBytes(3).toString("hex").toUpperCase(); } while (rooms.has(c)); return c; }
+function shuffle(a) { a = [...a]; for (let i=a.length-1;i>0;i--) { const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
+function publicQuestion(q) { return q ? { id:q.id, text:q.text, options:q.options, category:q.category } : null; }
 function emitRoom(room) {
-  for (const p of room.players.values()) io.to(p.id).emit("room:state", roomPayload(room, p.id));
-}
-function stopTimer(room) {
-  if (room.timer) clearTimeout(room.timer);
-  room.timer = null;
-}
-function startQuestionTimer(room) {
-  stopTimer(room);
-  room.deadline = Date.now() + QUESTION_MS;
-  room.timer = setTimeout(() => advanceQuestion(room.code), QUESTION_MS);
-}
-function advanceQuestion(roomCode) {
-  const room = rooms.get(roomCode);
-  if (!room || room.status !== "playing") return;
-  room.advanceScheduled = false;
-  stopTimer(room);
-  if (room.questionIndex + 1 >= room.questions.length) {
-    room.status = "finished"; room.deadline = null; emitRoom(room); return;
-  }
-  room.questionIndex++;
-  for (const p of room.players.values()) p.answered = false;
-  startQuestionTimer(room);
-  emitRoom(room);
-}
-function maybeAdvance(room) {
-  const active = [...room.players.values()].filter(p => p.connected);
-  if (!active.length || !active.every(p => p.answered) || room.advanceScheduled) return;
-  room.advanceScheduled = true;
-  setTimeout(() => {
-    const current = rooms.get(room.code);
-    if (current !== room || room.status !== "playing") return;
-    room.advanceScheduled = false;
-    advanceQuestion(room.code);
-  }, 350);
-}
-function closeRoom(room, reason = "The host left. This room has been closed.") {
-  stopTimer(room);
-  for (const p of room.players.values()) {
-    io.to(p.id).emit("room:closed", { message: reason });
-    playerRoom.delete(p.id);
-  }
-  rooms.delete(room.code);
-}
-function shuffle(a) {
-  const copy = [...a];
-  for (let i = copy.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [copy[i], copy[j]] = [copy[j], copy[i]]; }
-  return copy;
-}
-function error(socket, message) { socket.emit("app:error", { message }); }
-
-io.on("connection", socket => {
-  socket.on("room:create", ({ nickname } = {}) => {
-    nickname = String(nickname || "").trim().slice(0, 20);
-    if (!nickname) return error(socket, "Enter a nickname first.");
-    const roomCode = code();
-    const p = { id: socket.id, nickname, label: "Player 1", isHost: true, connected: true, score: 0, answered: false };
-    const room = { code: roomCode, hostId: socket.id, players: new Map([[socket.id, p]]), status: "lobby", questions: [], questionIndex: -1, deadline: null, timer: null, advanceScheduled: false };
-    rooms.set(roomCode, room); playerRoom.set(socket.id, roomCode); socket.join(roomCode); socket.emit("room:created", { code: roomCode }); emitRoom(room);
+  for (const p of room.players.values()) if (p.socketId) io.to(p.socketId).emit("room:state", {
+    code:room.code, hostId:room.hostId, status:room.status,
+    players:[...room.players.values()].map(x=>({id:x.id,label:x.id===p.id?x.nickname:x.label,isHost:x.id===room.hostId,connected:x.connected,answered:x.answered,isMe:x.id===p.id})),
+    questionIndex:room.questionIndex, questionCount:room.questions.length || MATCH_QUESTIONS,
+    question:room.status==="playing"?publicQuestion(room.questions[room.questionIndex]):null,
+    deadline:room.deadline, serverNow:Date.now(), answered:p.answered,
+    scores:[...room.players.values()].map(x=>({id:x.id,label:x.id===p.id?x.nickname:x.label,score:x.score})).sort((a,b)=>b.score-a.score)
   });
-  socket.on("room:join", ({ code: roomCode, nickname } = {}) => {
-    roomCode = String(roomCode || "").trim().toUpperCase();
-    nickname = String(nickname || "").trim().slice(0, 20);
-    const room = rooms.get(roomCode);
-    if (!nickname) return error(socket, "Enter a nickname first.");
-    if (!room) return error(socket, "Room not found. Check the code.");
-    if (room.status !== "lobby") return error(socket, "This match has already started.");
-    if (room.players.size >= MAX_PLAYERS) return error(socket, "This room is full.");
-    if ([...room.players.values()].some(p => p.nickname.toLowerCase() === nickname.toLowerCase())) return error(socket, "That nickname is already in use in this room.");
-    const usedLabels = new Set([...room.players.values()].map(player => player.label));
-    let labelNumber = 2;
-    while (usedLabels.has(`Player ${labelNumber}`)) labelNumber++;
-    const p = { id: socket.id, nickname, label: `Player ${labelNumber}`, isHost: false, connected: true, score: 0, answered: false };
-    room.players.set(socket.id, p); playerRoom.set(socket.id, roomCode); socket.join(roomCode); emitRoom(room);
+}
+function err(s, message) { s.emit("app:error", { message }); }
+function stopTimer(r) { if (r.timer) clearTimeout(r.timer); r.timer=null; }
+function closeRoom(r, message="The host left. This room has been closed.") {
+  stopTimer(r);
+  for (const p of r.players.values()) { if(p.socketId) io.to(p.socketId).emit("room:closed",{message}); sessions.delete(p.sessionToken); if(p.socketId) socketRoom.delete(p.socketId); }
+  rooms.delete(r.code);
+}
+function scheduleAdvance(r) {
+  if (r.advanceScheduled || r.status!=="playing") return;
+  r.advanceScheduled=true;
+  setTimeout(()=>{ if(rooms.get(r.code)!==r || r.status!=="playing") return; r.advanceScheduled=false; advance(r); },250);
+}
+function advance(r) {
+  if(r.status!=="playing") return;
+  stopTimer(r);
+  if(r.questionIndex+1>=r.questions.length) { r.status="finished"; r.deadline=null; emitRoom(r); return; }
+  r.questionIndex++; for(const p of r.players.values()) p.answered=false;
+  r.deadline=Date.now()+QUESTION_MS;
+  r.timer=setTimeout(()=>scheduleAdvance(r),QUESTION_MS);
+  emitRoom(r);
+}
+function maybeAdvance(r) { const active=[...r.players.values()].filter(p=>p.connected); if(active.length && active.every(p=>p.answered)) scheduleAdvance(r); }
+function removePlayer(r,p,message="The host removed you from the room.") {
+  if(p.socketId) { io.to(p.socketId).emit("room:removed",{message}); io.sockets.sockets.get(p.socketId)?.leave(r.code); socketRoom.delete(p.socketId); }
+  sessions.delete(p.sessionToken); if(p.reconnectTimer) clearTimeout(p.reconnectTimer); r.players.delete(p.id); emitRoom(r); maybeAdvance(r);
+}
+function makePlayer(socket,nickname,label,isHost,room) {
+  const p={id:randomUUID(),sessionToken:randomBytes(24).toString("hex"),socketId:socket.id,nickname,label,isHost,connected:true,score:0,answered:false,reconnectTimer:null};
+  room.players.set(p.id,p); sessions.set(p.sessionToken,{roomCode:room.code,playerId:p.id,expiresAt:Date.now()+GRACE_MS}); socketRoom.set(socket.id,room.code); socket.join(room.code); return p;
+}
+io.on("connection", socket=>{
+  socket.on("room:create",({nickname}={})=>{
+    nickname=String(nickname||"").trim().slice(0,20); if(!nickname) return err(socket,"Enter your nickname first.");
+    if(socketRoom.has(socket.id)) return err(socket,"Leave your current room first.");
+    const code=roomCode(), room={code,hostId:null,players:new Map(),status:"lobby",questions:[],questionIndex:-1,deadline:null,timer:null,advanceScheduled:false,lastActivity:Date.now()};
+    rooms.set(code,room); const p=makePlayer(socket,nickname,"Player 1",true,room); room.hostId=p.id;
+    socket.emit("room:created",{code,sessionToken:p.sessionToken}); emitRoom(room);
   });
-  socket.on("match:start", () => {
-    const room = rooms.get(playerRoom.get(socket.id));
-    if (!room) return error(socket, "Room no longer exists.");
-    if (room.hostId !== socket.id) return error(socket, "Only the host can start the match.");
-    if (room.status !== "lobby") return error(socket, "The match has already started.");
-    if (room.players.size < 2) return error(socket, "Invite at least one more player before starting.");
-    room.questions = shuffle(QUESTION_BANK).slice(0, MATCH_QUESTIONS);
-    room.status = "playing"; room.questionIndex = 0;
-    for (const p of room.players.values()) { p.score = 0; p.answered = false; }
-    startQuestionTimer(room); emitRoom(room);
+  socket.on("room:join",({code,nickname}={})=>{
+    code=String(code||"").trim().toUpperCase(); nickname=String(nickname||"").trim().slice(0,20);
+    if(!nickname) return err(socket,"Enter your nickname first.");
+    if(socketRoom.has(socket.id)) return err(socket,"Leave your current room first.");
+    const r=rooms.get(code); if(!r) return err(socket,"Room not found. Check the code.");
+    if(r.status!=="lobby") return err(socket,"This match has already started.");
+    if(r.players.size>=MAX_PLAYERS) return err(socket,"This room is full.");
+    if([...r.players.values()].some(p=>p.nickname.toLowerCase()===nickname.toLowerCase())) return err(socket,"That nickname is already in use.");
+    const labels=new Set([...r.players.values()].map(p=>p.label)); let n=2; while(labels.has(`Player ${n}`)) n++;
+    const p=makePlayer(socket,nickname,`Player ${n}`,false,r); socket.emit("room:joined",{code,sessionToken:p.sessionToken}); emitRoom(r);
   });
-  socket.on("answer:submit", ({ questionId, optionIndex } = {}) => {
-    const room = rooms.get(playerRoom.get(socket.id));
-    const p = room?.players.get(socket.id);
-    if (!room || !p || room.status !== "playing") return;
-    const q = room.questions[room.questionIndex];
-    if (!q || q.id !== Number(questionId) || p.answered || Date.now() >= room.deadline) return;
-    p.answered = true;
-    if (Number(optionIndex) === q.correctIndex) {
-      const remaining = Math.max(0, room.deadline - Date.now());
-      p.score += 1000 + Math.round(500 * remaining / QUESTION_MS);
-    }
-    emitRoom(room); maybeAdvance(room);
+  socket.on("session:resume",({sessionToken}={})=>{
+    const ses=sessions.get(String(sessionToken||"")); if(!ses || ses.expiresAt<Date.now()) { sessions.delete(String(sessionToken||"")); return socket.emit("session:resume-failed",{message:"Your session expired. Join the room again."}); }
+    const r=rooms.get(ses.roomCode), p=r?.players.get(ses.playerId); if(!r||!p) { sessions.delete(String(sessionToken||"")); return socket.emit("session:resume-failed",{message:"That room is no longer available."}); }
+    if(p.reconnectTimer) clearTimeout(p.reconnectTimer); p.socketId=socket.id; p.connected=true;
+    sessions.set(p.sessionToken,{...ses,expiresAt:Date.now()+GRACE_MS}); socketRoom.set(socket.id,r.code); socket.join(r.code);
+    socket.emit("session:resumed",{code:r.code,sessionToken:p.sessionToken}); emitRoom(r);
   });
-  socket.on("player:remove", ({ playerId } = {}) => {
-    const room = rooms.get(playerRoom.get(socket.id));
-    if (!room || room.hostId !== socket.id || playerId === socket.id) return error(socket, "Only the host can remove another player.");
-    const p = room.players.get(playerId);
-    if (!p) return;
-    io.to(playerId).emit("room:removed", { message: "The host removed you from the room." });
-    io.sockets.sockets.get(playerId)?.leave(room.code);
-    playerRoom.delete(playerId); room.players.delete(playerId); emitRoom(room); maybeAdvance(room);
+  socket.on("match:start",()=>{
+    const r=rooms.get(socketRoom.get(socket.id)), p=r&&[...r.players.values()].find(x=>x.socketId===socket.id);
+    if(!r||!p) return err(socket,"Room no longer exists.");
+    if(p.id!==r.hostId) return err(socket,"Only the host can start the match.");
+    if(r.status!=="lobby") return err(socket,"The match has already started.");
+    if(r.players.size<2) return err(socket,"Invite at least one more player before starting.");
+    r.questions=shuffle(QUESTIONS).slice(0,MATCH_QUESTIONS); r.status="playing"; r.questionIndex=0; r.advanceScheduled=false;
+    for(const x of r.players.values()){x.score=0;x.answered=false;}
+    r.deadline=Date.now()+QUESTION_MS; r.timer=setTimeout(()=>scheduleAdvance(r),QUESTION_MS); emitRoom(r);
   });
-  socket.on("match:replay", () => {
-    const room = rooms.get(playerRoom.get(socket.id));
-    if (!room || room.hostId !== socket.id || room.status !== "finished") return error(socket, "Only the host can start a replay.");
-    room.status = "lobby"; room.questions = []; room.questionIndex = -1; room.deadline = null;
-    for (const p of room.players.values()) { p.score = 0; p.answered = false; }
-    emitRoom(room);
+  socket.on("answer:submit",({questionId,optionIndex}={})=>{
+    const r=rooms.get(socketRoom.get(socket.id)), p=r&&[...r.players.values()].find(x=>x.socketId===socket.id);
+    if(!r||!p||r.status!=="playing") return;
+    const q=r.questions[r.questionIndex], index=Number(optionIndex);
+    if(!q||q.id!==Number(questionId)||p.answered||Date.now()>=r.deadline||!Number.isInteger(index)||index<0||index>3) return;
+    p.answered=true; if(index===q.correctIndex) p.score+=1000+Math.round(500*Math.max(0,r.deadline-Date.now())/QUESTION_MS);
+    emitRoom(r); maybeAdvance(r);
   });
-  socket.on("room:leave", () => {
-    const room = rooms.get(playerRoom.get(socket.id));
-    if (!room) return;
-    if (room.hostId === socket.id) return closeRoom(room);
-    room.players.delete(socket.id); playerRoom.delete(socket.id); socket.leave(room.code); emitRoom(room); maybeAdvance(room);
+  socket.on("player:remove",({playerId}={})=>{
+    const r=rooms.get(socketRoom.get(socket.id)), p=r&&[...r.players.values()].find(x=>x.socketId===socket.id);
+    if(!r||!p||p.id!==r.hostId) return err(socket,"Only the host can remove players.");
+    if(r.status!=="lobby") return err(socket,"Players can only be removed from the lobby.");
+    const target=r.players.get(String(playerId)); if(target&&target.id!==r.hostId) removePlayer(r,target);
   });
-  socket.on("disconnect", () => {
-    const room = rooms.get(playerRoom.get(socket.id));
-    if (!room) return;
-    if (room.hostId === socket.id) return closeRoom(room);
-    const p = room.players.get(socket.id);
-    if (p) { room.players.delete(socket.id); playerRoom.delete(socket.id); emitRoom(room); maybeAdvance(room); }
+  socket.on("match:replay",()=>{
+    const r=rooms.get(socketRoom.get(socket.id)), p=r&&[...r.players.values()].find(x=>x.socketId===socket.id);
+    if(!r||!p||p.id!==r.hostId) return err(socket,"Only the host can start a rematch.");
+    if(r.status!=="finished") return err(socket,"The match has not finished.");
+    stopTimer(r); r.status="lobby"; r.questions=[]; r.questionIndex=-1; r.deadline=null; r.advanceScheduled=false;
+    for(const x of r.players.values()){x.score=0;x.answered=false;} emitRoom(r);
+  });
+  socket.on("room:leave",()=>{
+    const r=rooms.get(socketRoom.get(socket.id)), p=r&&[...r.players.values()].find(x=>x.socketId===socket.id); if(!r||!p)return;
+    if(p.id===r.hostId) return closeRoom(r);
+    removePlayer(r,p,"You left the room."); socket.leave(r.code);
+  });
+  socket.on("disconnect",()=>{
+    const code=socketRoom.get(socket.id); socketRoom.delete(socket.id); const r=rooms.get(code);
+    const p=r&&[...r.players.values()].find(x=>x.socketId===socket.id); if(!r||!p)return;
+    p.connected=false;p.socketId=null;sessions.set(p.sessionToken,{roomCode:r.code,playerId:p.id,expiresAt:Date.now()+GRACE_MS});emitRoom(r);
+    p.reconnectTimer=setTimeout(()=>{
+      if(rooms.get(r.code)!==r||p.connected)return;
+      if(p.id===r.hostId) closeRoom(r,"The host disconnected and did not reconnect. This room has been closed.");
+      else {sessions.delete(p.sessionToken);r.players.delete(p.id);emitRoom(r);maybeAdvance(r);}
+    },GRACE_MS);
   });
 });
-
-server.listen(PORT, "0.0.0.0", () => console.log(`Quiz Clash server listening on ${PORT}`));
+httpServer.listen(PORT,"0.0.0.0",()=>console.log(`Quiz Clash server listening on ${PORT}`));
